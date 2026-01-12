@@ -14,4 +14,9 @@ anyhow = "1.0"
 bytes = "1.5"
 byteorder = "1.5"
 hex = "0.4"
+rand = "0.8"
+dashmap = "5"
+tokio-util = { version = "0.7", features = ["time"] }
+num_cpus = "1.17"
+futures = "0.3"
 
