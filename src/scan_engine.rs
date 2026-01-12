@@ -1,13 +1,13 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
+use tokio::io::AsyncWriteExt;
+use std::io::Write;
 use crate::config::Config;
 use crate::files::FilesHandler;
 use crate::net_tools::NetTools;
 use crate::brute_engine::BruteEngine;
-use crate::rfb::RFBProtocol;
-use std::fs::OpenOptions;
-use std::io::Write;
+use crate::rfb::RFBProtocol; 
 
 pub struct ScanEngine {
     config: Arc<Config>,
@@ -31,26 +31,38 @@ impl ScanEngine {
         let (start_ip, end_ip) = range;
         let total = end_ip.saturating_sub(start_ip) as usize;
         
-        let semaphore = Arc::new(Semaphore::new(self.config.scan_threads.min(20000)));
-        let found = Arc::new(Mutex::new(0u64));
-        let current = Arc::new(Mutex::new(0u64));
+        // Limit concurrency and avoid spawning all tasks at once
+        let semaphore = Arc::new(Semaphore::new(self.config.scan_threads.min(2000)));
+        let found = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let current = Arc::new(std::sync::atomic::AtomicU64::new(0));
         
+        // Async writer for ips to avoid blocking the runtime
         let ips_path = self.files.get_ips_path();
-        let file = Arc::new(Mutex::new(
-            OpenOptions::new()
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1000);
+        let writer_handle = tokio::spawn(async move {
+            let mut file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&ips_path)?,
-        ));
+                .open(&ips_path)
+                .await
+                .expect("Failed to open ips file");
+            while let Some(line) = rx.recv().await {
+                if let Err(e) = file.write_all(line.as_bytes()).await {
+                    eprintln!("Failed to write ip: {}", e);
+                }
+                let _ = file.write_all(b"\n").await;
+                let _ = file.flush().await;
+            }
+        });
         
-        // Output task
+        // Output task (reads atomics)
         let current_clone = current.clone();
         let found_clone = found.clone();
         let output_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                let curr = *current_clone.lock().unwrap();
-                let fnd = *found_clone.lock().unwrap();
+                let curr = current_clone.load(std::sync::atomic::Ordering::Relaxed);
+                let fnd = found_clone.load(std::sync::atomic::Ordering::Relaxed);
                 if curr as usize >= total {
                     break;
                 }
@@ -67,32 +79,28 @@ impl ScanEngine {
             let semaphore_clone = semaphore.clone();
             let found_clone = found.clone();
             let current_clone = current.clone();
-            let file_clone = file.clone();
             let net_tools_clone = self.net_tools.clone();
             let config_clone = self.config.clone();
             
+            // Acquire an owned permit before spawning so we don't create too many tasks
+            let permit = semaphore_clone.acquire_owned().await.unwrap();
+            let tx_clone = tx.clone();
             let handle = tokio::spawn(async move {
-                let permit = semaphore_clone.acquire().await.unwrap();
                 let ip_str = net_tools_clone.int2ip(ip_int);
-                
                 // Perform RFB protocol check (not just TCP connect)
                 let mut rfb = RFBProtocol::new(&ip_str, "", config_clone.scan_port, config_clone.scan_timeout);
                 match rfb.connect().await {
                     Ok(_) => {
-                        // RFB handshake successful
-                        let mut file_guard = file_clone.lock().unwrap();
-                        writeln!(file_guard, "{}:{}", ip_str, config_clone.scan_port).ok();
-                        drop(file_guard);
-                        
-                        *found_clone.lock().unwrap() += 1;
+                        // RFB handshake successful, send to writer
+                        let _ = tx_clone.send(format!("{}:{}", ip_str, config_clone.scan_port)).await;
+                        found_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     Err(_e) => {
                         // Not a VNC/RFB server or handshake failed
-                        // eprintln!("{}:{} - {}", ip_str, config_clone.scan_port, _e);
                     }
                 }
-                
-                *current_clone.lock().unwrap() += 1;
+
+                current_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 drop(permit);
             });
             
@@ -103,9 +111,12 @@ impl ScanEngine {
         for handle in handles {
             handle.await.ok();
         }
-        
+
+        // Close writer and wait for it to finish
+        drop(tx);
+        writer_handle.await.ok();
         output_handle.abort();
-        
+
         println!("\n\nDONE! Check \"output/ips.txt\" or type \"show ips\"!\n");
         
         // Auto brute if enabled

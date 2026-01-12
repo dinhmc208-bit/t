@@ -1,12 +1,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
+use tokio::io::AsyncWriteExt;
+use std::io::Write;
 use crate::config::Config;
 use crate::files::FilesHandler;
 use crate::net_tools::NetTools;
 use crate::rfb::RFBProtocol;
-use std::fs::OpenOptions;
-use std::io::Write;
 
 pub struct BruteEngine {
     config: Arc<Config>,
@@ -43,15 +43,27 @@ impl BruteEngine {
             return Ok(());
         }
         
-        let semaphore = Arc::new(Semaphore::new(self.config.brute_threads.min(20000)));
+        let semaphore = Arc::new(Semaphore::new(self.config.brute_threads.min(2000)));
         let servers_mutex = Arc::new(Mutex::new(servers));
         let results_path = self.files.get_results_path();
-        let results_file = Arc::new(Mutex::new(
-            OpenOptions::new()
+
+        // Async writer for results
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1000);
+        let results_writer = tokio::spawn(async move {
+            let mut file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&results_path)?,
-        ));
+                .open(&results_path)
+                .await
+                .expect("Failed to open results file");
+            while let Some(line) = rx.recv().await {
+                if let Err(e) = file.write_all(line.as_bytes()).await {
+                    eprintln!("Failed to write result: {}", e);
+                }
+                let _ = file.write_all(b"\n").await;
+                let _ = file.flush().await;
+            }
+        });
         
         let current_password = Arc::new(Mutex::new(Option::<String>::None));
         let output_kill = Arc::new(Mutex::new(false));
@@ -87,12 +99,12 @@ impl BruteEngine {
             for server in servers_clone {
                 let semaphore_clone = semaphore.clone();
                 let servers_mutex_clone = servers_mutex.clone();
-                let results_file_clone = results_file.clone();
+                let tx_clone = tx.clone();
                 let config_clone = self.config.clone();
                 let password_clone = password.clone();
                 
                 let handle = tokio::spawn(async move {
-                    let permit = semaphore_clone.acquire().await.unwrap();
+                    let permit = semaphore_clone.acquire_owned().await.unwrap();
                     let mut rfb = RFBProtocol::new(
                         &server.host,
                         &password_clone,
@@ -104,25 +116,25 @@ impl BruteEngine {
                         Ok(_) => {
                             if rfb.rfb && rfb.connected {
                                 // Remove server from list
-                                let mut servers_guard = servers_mutex_clone.lock().unwrap();
-                                servers_guard.retain(|s| s.host != server.host || s.port != server.port);
-                                drop(servers_guard);
+                                {
+                                    let mut servers_guard = servers_mutex_clone.lock().unwrap();
+                                    servers_guard.retain(|s| s.host != server.host || s.port != server.port);
+                                }
                                 
                                 let password_display = if rfb.null {
                                     "null".to_string()
                                 } else {
-                                    password_clone
+                                    password_clone.clone()
                                 };
                                 
                                 let name = rfb.name.as_deref().unwrap_or("");
-                                let result_line = format!("{}:{}-{}-[{}]\n", 
+                                let result_line = format!("{}:{}-{}-[{}]", 
                                     server.host, server.port, password_display, name);
                                 
-                                let mut file_guard = results_file_clone.lock().unwrap();
-                                write!(file_guard, "{}", result_line).ok();
-                                drop(file_guard);
+                                // Send to async writer
+                                let _ = tx_clone.send(result_line).await;
                                 
-                                println!("\r[*] {}:{} - {}              \n", 
+                                println!("\r[*] {}:{} - {}              ", 
                                     server.host, server.port, password_display);
                             }
                         }
@@ -145,6 +157,10 @@ impl BruteEngine {
         
         *output_kill.lock().unwrap() = true;
         output_handle.abort();
+
+        // Close results writer and wait for it
+        drop(tx);
+        results_writer.await.ok();
         
         println!("\n\nDONE! Check \"output/results.txt\" or type \"show results\"!\n");
         
