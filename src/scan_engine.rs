@@ -1,12 +1,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::TcpStream;
-use tokio::time::timeout;
 use tokio::sync::Semaphore;
 use crate::config::Config;
 use crate::files::FilesHandler;
 use crate::net_tools::NetTools;
 use crate::brute_engine::BruteEngine;
+use crate::rfb::RFBProtocol;
 use std::fs::OpenOptions;
 use std::io::Write;
 
@@ -74,22 +73,21 @@ impl ScanEngine {
             let handle = tokio::spawn(async move {
                 let permit = semaphore_clone.acquire().await.unwrap();
                 let ip_str = net_tools_clone.int2ip(ip_int);
-                let addr = format!("{}:{}", ip_str, config_clone.scan_port);
                 
-                match timeout(
-                    Duration::from_secs_f64(config_clone.scan_timeout),
-                    TcpStream::connect(&addr),
-                ).await {
-                    Ok(Ok(_stream)) => {
-                        // Connection successful
+                // Perform RFB protocol check (not just TCP connect)
+                let mut rfb = RFBProtocol::new(&ip_str, "", config_clone.scan_port, config_clone.scan_timeout);
+                match rfb.connect().await {
+                    Ok(_) => {
+                        // RFB handshake successful
                         let mut file_guard = file_clone.lock().unwrap();
                         writeln!(file_guard, "{}:{}", ip_str, config_clone.scan_port).ok();
                         drop(file_guard);
                         
                         *found_clone.lock().unwrap() += 1;
                     }
-                    _ => {
-                        // Connection failed or timeout
+                    Err(_e) => {
+                        // Not a VNC/RFB server or handshake failed
+                        // eprintln!("{}:{} - {}", ip_str, config_clone.scan_port, _e);
                     }
                 }
                 
