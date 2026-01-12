@@ -67,7 +67,8 @@ impl BruteEngine {
                 }
                 if let Some(pwd) = current_password_clone.lock().unwrap().as_ref() {
                     let servers = servers_clone.lock().unwrap();
-                    print!("\r Trying \"{}\" on {} servers    ", pwd, servers.len());
+                    let msg = format!(" Trying \"{}\" on {} servers", pwd, servers.len());
+                    print!("\r{:<80}", msg);
                     std::io::stdout().flush().ok();
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;

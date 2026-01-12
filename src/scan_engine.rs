@@ -54,7 +54,8 @@ impl ScanEngine {
                 if curr as usize >= total {
                     break;
                 }
-                print!("\r Current [{}/{}] Found: {}   ", curr, total, fnd);
+                let msg = format!(" Current [{}/{}] Found: {}", curr, total, fnd);
+                print!("\r{:<80}", msg);
                 std::io::stdout().flush().ok();
             }
         });
