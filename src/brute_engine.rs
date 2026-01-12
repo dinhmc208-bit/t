@@ -87,6 +87,48 @@ impl BruteEngine {
             }
         });
         
+        // Initial null-password check: try empty password for each server and remove successes
+        {
+            let mut handles_null = Vec::new();
+            let servers_guard = servers_mutex.lock().unwrap();
+            let servers_snapshot: Vec<Server> = servers_guard.clone();
+            drop(servers_guard);
+
+            for server in servers_snapshot {
+                let sem_clone = semaphore.clone();
+                let servers_mutex_clone = servers_mutex.clone();
+                let tx_clone = tx.clone();
+                let config_clone = self.config.clone();
+
+                let handle = tokio::spawn(async move {
+                    let permit = sem_clone.acquire_owned().await.unwrap();
+                    let mut rfb = RFBProtocol::new(&server.host, "", server.port, config_clone.brute_timeout);
+                    match rfb.connect().await {
+                        Ok(_) => {
+                            if rfb.rfb && rfb.connected {
+                                let password_display = "null".to_string();
+                                let name = rfb.name.as_deref().unwrap_or("");
+                                let result_line = format!("{}:{}-{}-[{}]", server.host, server.port, password_display, name);
+                                let _ = tx_clone.send(result_line).await;
+                                println!("\r[*] {}:{} - {}              ", server.host, server.port, password_display);
+                                // Remove server from list
+                                {
+                                    let mut servers_guard = servers_mutex_clone.lock().unwrap();
+                                    servers_guard.retain(|s| s.host != server.host || s.port != server.port);
+                                }
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                    drop(permit);
+                });
+
+                handles_null.push(handle);
+            }
+
+            for h in handles_null { h.await.ok(); }
+        }
+
         // Brute force tasks
         for password in passwords {
             *current_password.lock().unwrap() = Some(password.clone());
